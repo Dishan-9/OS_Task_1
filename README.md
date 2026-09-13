@@ -6,4 +6,5 @@ I built this Java program to solve the classic Producer-Consumer synchronization
 logic:PRODUCER ↓ Creates data ↓ BUFFER ↓ Stores data temporarily ↓ CONSUMER ↓ Uses data
 
 2.matrix multiplication
-    d
+
+d
