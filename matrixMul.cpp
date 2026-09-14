@@ -9,63 +9,70 @@
 #include <random>
 #include <fstream>
 
-constexpr int N = 100;
-constexpr int K = 100;
-constexpr int M = 100;
+constexpr int ROWS_A = 100;
+constexpr int COLS_A = 100; 
+constexpr int COLS_B = 100;
 
-// Thread-safe log recorder
-struct FinishedCell {
+struct CellResult {
     int row;
     int col;
     long long value;
 };
 
-class ExecutionRecorder {
+class ExecutionLogger {
 public:
     void record(int r, int c, long long val) {
-        std::lock_guard<std::mutex> lock(recordMutex);
-        log.push_back({r, c, val});
+        std::lock_guard<std::mutex> lock(mtx);
+        records.push_back({r, c, val});
     }
 
-    void exportToCSV(const std::string& filename) {
-        std::ofstream file(filename);
-        file << "row,col,val\n";
-        for (const auto& item : log) {
-            file << item.row << "," << item.col << "," << item.value << "\n";
+    void dumpCsv(const std::string& filepath) {
+        std::ofstream out(filepath);
+        if (!out.is_open()) {
+            std::cerr << "Failed to open " << filepath << " for writing\n";
+            return;
+        }
+
+        out << "row,col,val\n";
+        for (const auto& item : records) {
+            out << item.row << "," << item.col << "," << item.value << "\n";
         }
     }
 
 private:
-    std::mutex recordMutex;
-    std::vector<FinishedCell> log;
+    std::mutex mtx;
+    std::vector<CellResult> records;
 };
 
 class ThreadPool {
 public:
-    explicit ThreadPool(size_t numThreads) : stop(false), activeTasks(0) {
-        for (size_t i = 0; i < numThreads; ++i) {
+    explicit ThreadPool(size_t threads) {
+        for (size_t i = 0; i < threads; ++i) {
             workers.emplace_back([this]() {
                 while (true) {
                     std::function<void()> task;
+
                     {
-                        std::unique_lock<std::mutex> lock(this->queueMutex);
-                        this->cv.wait(lock, [this]() {
-                            return this->stop || !this->tasks.empty();
+                        std::unique_lock<std::mutex> lock(queueMtx);
+                        cv.wait(lock, [this]() {
+                            return stopping || !taskQueue.empty();
                         });
 
-                        if (this->stop && this->tasks.empty()) return;
+                        if (stopping && taskQueue.empty()) {
+                            return;
+                        }
 
-                        task = std::move(this->tasks.front());
-                        this->tasks.pop();
+                        task = std::move(taskQueue.front());
+                        taskQueue.pop();
                     }
 
                     task();
 
                     {
-                        std::unique_lock<std::mutex> lock(this->queueMutex);
-                        --activeTasks;
-                        if (activeTasks == 0 && tasks.empty()) {
-                            finishedCv.notify_all();
+                        std::lock_guard<std::mutex> lock(queueMtx);
+                        --busyCount;
+                        if (busyCount == 0 && taskQueue.empty()) {
+                            doneCv.notify_all();
                         }
                     }
                 }
@@ -73,103 +80,110 @@ public:
         }
     }
 
-    void enqueue(std::function<void()> task) {
+    void submit(std::function<void()> task) {
         {
-            std::unique_lock<std::mutex> lock(queueMutex);
-            tasks.push(std::move(task));
-            ++activeTasks;
+            std::lock_guard<std::mutex> lock(queueMtx);
+            taskQueue.push(std::move(task));
+            ++busyCount;
         }
         cv.notify_one();
     }
 
-    void waitUntilDone() {
-        std::unique_lock<std::mutex> lock(queueMutex);
-        finishedCv.wait(lock, [this]() {
-            return tasks.empty() && activeTasks == 0;
+    void waitAll() {
+        std::unique_lock<std::mutex> lock(queueMtx);
+        doneCv.wait(lock, [this]() {
+            return taskQueue.empty() && busyCount == 0;
         });
     }
 
     ~ThreadPool() {
         {
-            std::unique_lock<std::mutex> lock(queueMutex);
-            stop = true;
+            std::lock_guard<std::mutex> lock(queueMtx);
+            stopping = true;
         }
         cv.notify_all();
-        for (std::thread& worker : workers) {
-            if (worker.joinable()) {
-                worker.join();
+
+        for (auto& t : workers) {
+            if (t.joinable()) {
+                t.join();
             }
         }
     }
 
 private:
     std::vector<std::thread> workers;
-    std::queue<std::function<void()>> tasks;
-    std::mutex queueMutex;
+    std::queue<std::function<void()>> taskQueue;
+    std::mutex queueMtx;
     std::condition_variable cv;
-    std::condition_variable finishedCv;
-    bool stop;
-    size_t activeTasks;
+    std::condition_variable doneCv;
+    bool stopping = false;
+    size_t busyCount = 0;
 };
 
-void computeSingleCell(const std::vector<std::vector<long long>>& A,
-                       const std::vector<std::vector<long long>>& B,
-                       std::vector<std::vector<long long>>& C,
-                       ExecutionRecorder& recorder,
-                       int row, int col) {
-    long long sum = 0;
-    for (int k = 0; k < K; ++k) {
-        sum += A[row][k] * B[k][col];
+void multiplyCell(const std::vector<std::vector<long long>>& A,
+                  const std::vector<std::vector<long long>>& B,
+                  std::vector<std::vector<long long>>& C,
+                  ExecutionLogger& logger,
+                  int r, int c) {
+    long long dot = 0;
+    for (int k = 0; k < COLS_A; ++k) {
+        dot += A[r][k] * B[k][c];
     }
-    C[row][col] = sum;
-    recorder.record(row, col, sum);
+    C[r][c] = dot;
+    logger.record(r, c, dot);
 }
 
 int main() {
-    std::vector<std::vector<long long>> A(N, std::vector<long long>(K));
-    std::vector<std::vector<long long>> B(K, std::vector<long long>(M));
-    std::vector<std::vector<long long>> C(N, std::vector<long long>(M, 0));
+    using Matrix = std::vector<std::vector<long long>>;
 
-    std::mt19937 rng(42);
+    Matrix A(ROWS_A, std::vector<long long>(COLS_A));
+    Matrix B(COLS_A, std::vector<long long>(COLS_B));
+    Matrix C(ROWS_A, std::vector<long long>(COLS_B, 0));
+
+    // Fill matrices with small random values
+    std::mt19937 rng(1337);
     std::uniform_int_distribution<long long> dist(0, 9);
 
-    for (int i = 0; i < N; ++i)
-        for (int j = 0; j < K; ++j)
+    for (int i = 0; i < ROWS_A; ++i) {
+        for (int j = 0; j < COLS_A; ++j) {
             A[i][j] = dist(rng);
+        }
+    }
 
-    for (int i = 0; i < K; ++i)
-        for (int j = 0; j < M; ++j)
+    for (int i = 0; i < COLS_A; ++i) {
+        for (int j = 0; j < COLS_B; ++j) {
             B[i][j] = dist(rng);
+        }
+    }
 
-    unsigned int coreCount = std::thread::hardware_concurrency();
-    if (coreCount == 0) coreCount = 4;
+    unsigned int workerCount = std::thread::hardware_concurrency();
+    if (workerCount == 0) workerCount = 4;
 
-    std::cout << "Submitting " << (N * M) 
-              << " independent cell operations across " 
-              << coreCount << " hardware threads...\n";
+    std::cout << "Dispatching " << (ROWS_A * COLS_B) << " tasks over " 
+              << workerCount << " worker threads...\n";
 
-    ThreadPool pool(coreCount);
-    ExecutionRecorder recorder;
+    ThreadPool pool(workerCount);
+    ExecutionLogger logger;
 
-    auto startTime = std::chrono::high_resolution_clock::now();
+    auto t0 = std::chrono::steady_clock::now();
 
-    for (int r = 0; r < N; ++r) {
-        for (int c = 0; c < M; ++c) {
-            pool.enqueue([&A, &B, &C, &recorder, r, c]() {
-                computeSingleCell(A, B, C, recorder, r, c);
+    for (int r = 0; r < ROWS_A; ++r) {
+        for (int c = 0; c < COLS_B; ++c) {
+            pool.submit([&A, &B, &C, &logger, r, c]() {
+                multiplyCell(A, B, C, logger, r, c);
             });
         }
     }
 
-    pool.waitUntilDone();
+    pool.waitAll();
 
-    auto endTime = std::chrono::high_resolution_clock::now();
-    std::chrono::duration<double, std::milli> elapsed = endTime - startTime;
+    auto t1 = std::chrono::steady_clock::now();
+    std::chrono::duration<double, std::milli> ms = t1 - t0;
 
-    std::cout << "Finished all cell calculations in: " << elapsed.count() << " ms\n";
-    
-    recorder.exportToCSV("execution_log.csv");
-    std::cout << "Saved real thread execution order to 'execution_log.csv'.\n";
+    std::cout << "Done in " << ms.count() << " ms\n";
+
+    logger.dumpCsv("execution_log.csv");
+    std::cout << "Output saved to execution_log.csv\n";
 
     return 0;
 }
